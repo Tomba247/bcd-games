@@ -3208,6 +3208,164 @@ int ios_syscall_frame_user( uintptr_t teb, uint64_t *pc, uint64_t *lr, uint64_t 
     return 1;
 }
 
+/* [crash-dump] Black Ops III / Arxan null call (diagnostic, off by default).
+ *
+ * BO3 dies at its first guest crash on `call r10` with r10 = 0, right after its
+ * anti-tamper code walked kernelbase.dll's export names and found nothing. That
+ * code is encrypted in the exe and only readable after it decrypts itself, so a
+ * file copy of the exe cannot show which function it looked for. With
+ * env.MADEIRA_CRASH_CODE_DUMP = 1 the first guest crash in a process prints the
+ * loader's module list (InLoadOrderModuleList, the order the game walks), 10 KB
+ * of x86 code around the RIP, 1 KB of the x86 stack and the code around each
+ * stack value that points into the RIP's module. It also writes every
+ * executable section of that module, as it is in memory, to
+ * <prefix>/drive_c/madeira-crash-<rva>.bin. Every read goes through
+ * mach_vm_read_overwrite, so an unmapped address prints <unreadable> instead of
+ * faulting, and nothing is written to guest memory. */
+static int ios_diag_read( uint64_t addr, void *buf, size_t len )
+{
+    mach_vm_size_t got = 0;
+    if (addr < 0x10000 || addr >= 0x0000800000000000ULL) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, len,
+                                (mach_vm_address_t)(uintptr_t)buf, &got ) != KERN_SUCCESS)
+        return 0;
+    return (int)got;
+}
+
+static void ios_diag_hexdump( const char *tag, uint64_t start, size_t len )
+{
+    static const char digits[] = "0123456789abcdef";
+    unsigned char line[32];
+    char hex[sizeof(line) * 2 + 1];
+    uint64_t a;
+    int i;
+
+    for (a = start; a < start + len; a += sizeof(line))
+    {
+        if (ios_diag_read( a, line, sizeof(line) ) != (int)sizeof(line))
+        {
+            dprintf( STDERR_FILENO, "[%s] %016llx: <unreadable>\n", tag, (unsigned long long)a );
+            continue;
+        }
+        for (i = 0; i < (int)sizeof(line); i++)
+        {
+            hex[2 * i] = digits[line[i] >> 4];
+            hex[2 * i + 1] = digits[line[i] & 15];
+        }
+        hex[sizeof(line) * 2] = 0;
+        dprintf( STDERR_FILENO, "[%s] %016llx: %s\n", tag, (unsigned long long)a, hex );
+    }
+}
+
+static void ios_diag_write_sections( uint64_t base )
+{
+    static unsigned char chunk[0x10000];
+    uint32_t lfanew = 0, rva, vsize, ch;
+    uint16_t nsec = 0, optsize = 0, k;
+    uint64_t sec, off;
+    char path[1024];
+    int fd;
+
+    if (!config_dir) return;
+    if (ios_diag_read( base + 0x3c, &lfanew, 4 ) != 4 || lfanew > 0x1000) return;
+    if (ios_diag_read( base + lfanew + 6, &nsec, 2 ) != 2 || nsec > 96) return;
+    if (ios_diag_read( base + lfanew + 0x14, &optsize, 2 ) != 2) return;
+    sec = base + lfanew + 0x18 + optsize;
+    for (k = 0; k < nsec; k++, sec += 40)
+    {
+        if (ios_diag_read( sec + 8, &vsize, 4 ) != 4 || ios_diag_read( sec + 12, &rva, 4 ) != 4 ||
+            ios_diag_read( sec + 36, &ch, 4 ) != 4)
+            break;
+        if (!(ch & 0x20000000) || !vsize || vsize > 0x10000000) continue;  /* IMAGE_SCN_MEM_EXECUTE */
+        snprintf( path, sizeof(path), "%s/drive_c/madeira-crash-%x.bin", config_dir, rva );
+        fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 );
+        if (fd < 0)
+        {
+            dprintf( STDERR_FILENO, "[crash-dump] cannot write %s (errno %d)\n", path, errno );
+            continue;
+        }
+        for (off = 0; off < vsize; off += sizeof(chunk))
+        {
+            size_t len = vsize - off < sizeof(chunk) ? vsize - off : sizeof(chunk);
+            if (ios_diag_read( base + rva + off, chunk, len ) != (int)len) memset( chunk, 0, len );
+            if (write( fd, chunk, len ) != (ssize_t)len) break;
+        }
+        close( fd );
+        dprintf( STDERR_FILENO, "[crash-dump] wrote section rva=%x size=%x to %s\n", rva, vsize, path );
+    }
+}
+
+static void ios_diag_crash_dump( uint64_t teb, uint64_t rip, uint64_t rsp )
+{
+    static int done;
+    const char *env = getenv( "MADEIRA_CRASH_CODE_DUMP" );
+    uint64_t peb = 0, ldr = 0, head, ent = 0, mod_base = 0, mod_size = 0;
+    uint64_t stack[128], seen[12];
+    int n, i, nseen = 0;
+
+    if (!env || env[0] != '1') return;
+    if (__atomic_exchange_n( &done, 1, __ATOMIC_SEQ_CST )) return;
+
+    dprintf( STDERR_FILENO, "[crash-dump] begin rip=%llx rsp=%llx teb=%llx\n",
+             (unsigned long long)rip, (unsigned long long)rsp, (unsigned long long)teb );
+
+    if (teb && ios_diag_read( teb + 0x60, &peb, 8 ) == 8 && peb &&
+        ios_diag_read( peb + 0x18, &ldr, 8 ) == 8 && ldr)
+    {
+        head = ldr + 0x10;  /* PEB_LDR_DATA.InLoadOrderModuleList */
+        if (ios_diag_read( head, &ent, 8 ) != 8) ent = head;
+        for (n = 0; ent && ent != head && n < 256; n++)
+        {
+            uint64_t base = 0, buf = 0;
+            uint32_t size = 0;
+            uint16_t namelen = 0, wname[63];
+            char name[64];
+            int k, cnt;
+
+            ios_diag_read( ent + 0x30, &base, 8 );     /* DllBase */
+            ios_diag_read( ent + 0x40, &size, 4 );     /* SizeOfImage */
+            ios_diag_read( ent + 0x58, &namelen, 2 );  /* BaseDllName.Length */
+            ios_diag_read( ent + 0x60, &buf, 8 );      /* BaseDllName.Buffer */
+            cnt = namelen / 2;
+            if (cnt > 63) cnt = 63;
+            if (!buf || ios_diag_read( buf, wname, cnt * 2 ) != cnt * 2) cnt = 0;
+            for (k = 0; k < cnt; k++) name[k] = wname[k] < 0x80 ? (char)wname[k] : '?';
+            name[cnt] = 0;
+            dprintf( STDERR_FILENO, "[crash-dump] ldr[%d] base=%llx size=%x %s\n",
+                     n, (unsigned long long)base, size, name );
+            if (rip >= base && rip < base + size) { mod_base = base; mod_size = size; }
+            if (ios_diag_read( ent, &ent, 8 ) != 8) break;  /* InLoadOrderLinks.Flink */
+        }
+    }
+    else dprintf( STDERR_FILENO, "[crash-dump] no PEB loader data (peb=%llx ldr=%llx)\n",
+                  (unsigned long long)peb, (unsigned long long)ldr );
+
+    dprintf( STDERR_FILENO, "[crash-dump] rip module base=%llx size=%llx rva=%llx\n",
+             (unsigned long long)mod_base, (unsigned long long)mod_size,
+             (unsigned long long)(mod_base ? rip - mod_base : 0) );
+    ios_diag_hexdump( "crash-code", (rip & ~0x1fULL) - 0x2000, 0x2800 );
+    ios_diag_hexdump( "crash-stack", rsp & ~0x1fULL, 0x400 );
+
+    if (mod_base && ios_diag_read( rsp, stack, sizeof(stack) ) == (int)sizeof(stack))
+    {
+        for (i = 0; i < 128 && nseen < 12; i++)
+        {
+            uint64_t v = stack[i];
+            int j, dup = 0;
+            if (v < mod_base || v >= mod_base + mod_size) continue;
+            if (v + 0x2000 > rip && v < rip + 0x800) continue;  /* already in crash-code */
+            for (j = 0; j < nseen; j++) if (v + 0x200 > seen[j] && v < seen[j] + 0x200) dup = 1;
+            if (dup) continue;
+            seen[nseen++] = v;
+            dprintf( STDERR_FILENO, "[crash-dump] stack[+%x]=%llx rva=%llx\n", i * 8,
+                     (unsigned long long)v, (unsigned long long)(v - mod_base) );
+            ios_diag_hexdump( "crash-ret", (v & ~0x1fULL) - 0x180, 0x200 );
+        }
+    }
+    if (mod_base) ios_diag_write_sections( mod_base );
+    dprintf( STDERR_FILENO, "[crash-dump] end\n" );
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -8394,6 +8552,7 @@ skip_reclaim_band: ;
                             (unsigned long long)live_r12, (unsigned long long)live_r13,
                             (unsigned long long)live_r14, (unsigned long long)live_r15,
                             (unsigned long long)state_rip, (unsigned long long)state_cret);
+                        ios_diag_crash_dump( (uint64_t)teb_out, state_rip, live_rsp );
 
                         if (live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
                         {
